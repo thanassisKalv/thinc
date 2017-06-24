@@ -1,15 +1,6 @@
 #include <stdio.h>
 
 
-// Replace this with the saxpy from cuBlas or whatever?
-// I doubt it matters, but it's definitely weird to have this
-void __device__
-saxpy(float* X, const float* Y, float scale, int n)
-{
-    for (int i=0; i < n; ++i) 
-        X[i] += Y[i] * scale;
-}
-
 
 void __global__
 maxout(float* best__bo, int* which__bo,
@@ -38,67 +29,97 @@ maxout(float* best__bo, int* which__bo,
 }
 
 
+
 void __global__
 mean_pool(float* means__bo,
     const float* X__to, const int* lengths__b, int B, int T, int O)
 {
-    // Compute means of a batch of concatenated sequences, using the lengths.'''
-    int b = blockIdx.x; // Batch-item we're averaging
-    if (b >= B) return;
+	// Each CUDA block computes means of a batch of concatenated sequences, using the lengths. 
+    	int bid = blockIdx.x;
+	if(threadIdx.x>=O)
+		return;
+	__shared__ float local_means[512];	// can be bigger, depends on dimensions
 
-    // Go to the regions we're working on
-    for (int i=0; i < b; ++i) {
-        means__bo += O;
-	X__to += lengths__b[i] * O;
-    }
+	// At each step it keeps track of the total length of all previous batches (even those processed 
+	// other CUDA blocks)
+	int prevLengths = 0;
+	for(int i = 0; i<bid; i++)
+		prevLengths+=lengths__b[i];
 
-    int length = lengths__b[b];
-    // Each invocation of the kernel averages one batch.
-    float scale = 1. / length;
-    for (int _=0; _ < length; ++_) // Iterate over rows
-    {
-        saxpy(means__bo, X__to, scale, O);
-        X__to += O;
-    }
+	// Batch-items are processed by a fixed number of launched CUDA blocks
+	// with a step equal to the total number gridDim.x
+    	for(int step = bid; step < B; step += gridDim.x )
+	{
+		int lengthOfBatch = lengths__b[step];
+		int batchStarts = prevLengths*O; 
+		float scale = 1.0/(float)lengthOfBatch;
+		local_means[threadIdx.x] = 0.0;
+
+		for (int i = batchStarts + threadIdx.x; i < batchStarts+(lengthOfBatch*O) ; i += O)
+			local_means[threadIdx.x] += X__to[i]*scale;
+		
+		__syncthreads();	// Block-wise synchronization
+
+		means__bo[step*O + threadIdx.x] = local_means[threadIdx.x];
+
+		// prepare prevLength for next steps
+		for(int i = step; i<step+gridDim.x; i++)
+			prevLengths+=lengths__b[i];
+	}
 }
+
+
+
+
+
 
 
 void __global__
 max_pool(float* maxes__bo, int* which__bo,
     const float* X__to, const int* lengths__b, int B, int T, int O)
 {
-    // Compute means of a batch of concatenated sequences, using the lengths.'''
-    int b = blockIdx.x; // Batch-item we're averaging
-    if (b >= B) return;
+	// Each CUDA block computes maxes of a batch of concatenated sequences, using the lengths. 
+    	int bid = blockIdx.x;
+	if(threadIdx.x>=O)
+		return;
+	__shared__ float local_maxes[512];		// take advantage of faster local memory
+	__shared__ short local_which[512];
 
-    // Go to the regions we're working on
-    for (int i=0; i < b; ++i) {
-        maxes__bo += O;
-	which__bo += O;
-	X__to += lengths__b[i] * O;
-    }
+	// At each step block keeps track of the total length of all previous batches (even those processed 
+	// other CUDA blocks)
+	int prevLengths = 0;
+	for(int i = 0; i<bid; i++)
+		prevLengths+=lengths__b[i];
 
-    // Each invocation of the kernel maxes one batch.
-    // Start by assuming maxes are at i=0
-    for (int j=0; j < O; ++j) {
-        maxes__bo[j] = X__to[j];
-	which__bo[j] = 0;
-    }
-    X__to += O;
-    
-    int length = lengths__b[b];
-    for (int i=1; i < length; ++i) // Iterate over rows
-    {
-        for (int j=0; j < O; ++j)
+	// Batch-items are processed by a fixed number of launched CUDA blocks
+	// with a step equal to the total number gridDim.x
+    	for(int step = bid; step < B; step += gridDim.x )
 	{
-            if (X__to[j] > maxes__bo[j])
-            {
-                maxes__bo[j] = X__to[j];
-                which__bo[j] = i;
-	    }
+		int lengthOfBatch = lengths__b[step];
+		int batchStarts = prevLengths*O; 
+
+		local_maxes[threadIdx.x] = X__to[batchStarts+threadIdx.x];
+		local_which[threadIdx.x] = 0;
+		short j=1;	// the word index in a doc
+
+		for (int i = batchStarts+O+threadIdx.x; i < batchStarts+(lengthOfBatch*O) ; i += O)
+		{
+			if(X__to[i]>local_maxes[threadIdx.x])
+			{
+				local_maxes[threadIdx.x] =  X__to[i];
+				local_which[threadIdx.x] = j;
+			}
+			j++; 
+		}
+		__syncthreads();	// Block-wise synchronization
+
+		maxes__bo[step*O + threadIdx.x] = local_maxes[threadIdx.x];
+		which__bo[step*O + threadIdx.x] = local_which[threadIdx.x];
+
+		// prepare prevLength for next steps
+		for(int i = step; i<step+gridDim.x; i++)
+			prevLengths+=lengths__b[i];
 	}
-	X__to += O;
-    }
 }
 
 
@@ -106,49 +127,75 @@ void __global__
 backprop_mean_pool(float* dX__to, const float* d_means__bo, const int* lengths__b,
     int B, int T, int O)
 {
-    int b = blockIdx.x; // Batch-item we're averaging
-    if (b >= B) return;
-    
-    // Go to the regions we're working on
-    for (int i=0; i < b; ++i) {
-        d_means__bo += O;
-	dX__to += lengths__b[i] * O;
-    }
+	// Each CUDA block computes maxes of a batch of concatenated sequences, using the lengths. 
+    	int bid = blockIdx.x;
+	if(threadIdx.x>=O)
+		return;
 
-    int length = lengths__b[b];
-    float scale = 1./ length;
-    
-    for (int _=0; _ < length; _++)
-    {
-        saxpy(dX__to, d_means__bo, scale, O);
-        dX__to += O;
-    }
+	__shared__ float local_means[512];		// can be bigger, depends on dimensions
+
+	// At each step it keeps track of the total length of all previous batches (even those processed 
+	// other CUDA blocks)
+	int prevLengths = 0;
+	for(int i = 0; i<bid; i++)
+		prevLengths+=lengths__b[i];
+
+    	for(int step = bid; step < B; step += gridDim.x )
+	{
+		int lengthOfBatch = lengths__b[step];
+		int batchStarts = prevLengths*O; 
+		float scale = 1.0/(float)lengthOfBatch;
+		local_means[threadIdx.x] = d_means__bo[step*O+threadIdx.x]*scale;
+
+		for (int i = batchStarts + threadIdx.x; i < batchStarts+(lengthOfBatch*O) ; i += O)
+			dX__to[i] = local_means[threadIdx.x];
+
+		// prepare prevLength for next steps
+		for(int i = step; i<step+gridDim.x; i++)
+			prevLengths+=lengths__b[i];		
+	}
 }
+
 
 
 void __global__
 backprop_max_pool(float* dX__to,
     const float* d_maxes__bo, const int* which__bo, const int* lengths__b, int B, int T, int O)
 {
-    int b = blockIdx.x; // Batch-item we're averaging
-    if (b >= B) return;
-    
-    // Go to the regions we're working on
-    for (int i=0; i < b; ++i) {
-        d_maxes__bo += O;
-	which__bo += O;
-	dX__to += lengths__b[i] * O;
-    }
+	// Each CUDA block computes maxes of a batch of concatenated sequences, using the lengths. 
+    	int bid = blockIdx.x;
+	if(threadIdx.x>=O)
+		return;
+	__shared__ float local_maxes[512];		// can be bigger, depends on dimensions
+	__shared__ short local_which[512];
+	int prevLengths = 0;
+	for(int i = 0; i<bid; i++)
+		prevLengths+=lengths__b[i];
 
-    int length = lengths__b[b];
- 
-    for (int i=0; i < length; ++i)
-    {
-       for (int j=0; j < O; ++j)
-       {
-         if (which__bo[j] == i)
-           dX__to[j] += d_maxes__bo[j];
-       }
-       dX__to += O;
-    }
+    	for(int step = bid; step < B; step += gridDim.x )
+	{
+		int lengthOfBatch = lengths__b[step];
+		int batchStarts = prevLengths*O; 
+
+		local_maxes[threadIdx.x] = d_maxes__bo[step*O+threadIdx.x];
+		local_which[threadIdx.x] = which__bo[step*O+threadIdx.x];
+		short j=0;	// the word index in a doc
+
+		for (int i = batchStarts+threadIdx.x; i < batchStarts+(lengthOfBatch*O) ; i += O)
+		{
+			if(local_which[threadIdx.x]==j)
+			{
+				dX__to[i] =  local_maxes[threadIdx.x];
+			}
+			else
+				dX__to[i]=0;
+			j++; 
+		}
+
+		// prepare prevLength for next steps
+		for(int i = step; i<step+gridDim.x; i++)
+			prevLengths+=lengths__b[i];
+	}
 }
+
+
